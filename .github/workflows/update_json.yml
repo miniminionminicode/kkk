@@ -81,6 +81,6 @@ jobs:
           cp master_courses.json private-data/k/master_course_new.json
 
           cd private-data
-          git add k/master_course_new.json
+          git add kk/master_course_new.json
           git commit -m "Update master_course_new.json: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || exit 0
           git push
