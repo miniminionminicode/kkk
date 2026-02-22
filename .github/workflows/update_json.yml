@@ -52,7 +52,7 @@ jobs:
           echo "Preview master_courses.json (first 30 lines):"
           if [ -f master_courses.json ]; then head -n 30 master_courses.json; fi
 
-      - name: Push JSON to private repo (root of repo k)
+      - name: Push JSON to private repo (root of repo)
         env:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
@@ -74,17 +74,19 @@ jobs:
 
           git clone "https://x-access-token:${PUSH_TOKEN}@github.com/${PRIVATE_REPO}.git" private-data
 
-          # copy directly into the ROOT of the private repo
+          # Copy directly into the ROOT of the private repo
           cp master_courses.json private-data/master_course_new.json
 
           cd private-data
 
-          # commit only if file changed (prevents empty commits every 3 hours)
-          if git diff --quiet -- master_course_new.json; then
+          # Stage first so NEW/untracked file is included too
+          git add master_course_new.json
+
+          # Commit only if staged content changed
+          if git diff --cached --quiet; then
             echo "No changes in master_course_new.json — skipping commit."
             exit 0
           fi
 
-          git add master_course_new.json
           git commit -m "Update master_course_new.json: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push
