@@ -36,8 +36,6 @@ KEYWORDS = [k.strip().lower() for k in _keywords_env.split(",") if k.strip()]
 
 REFERER = os.getenv("REFERER")
 ORIGIN = os.getenv("ORIGIN")
-if not REFERER or not ORIGIN:
-    raise RuntimeError("Missing REFERER/ORIGIN secret")
 
 THREADS = int(os.getenv("THREADS", "3"))
 MASTER_JSON_FILE = "master_courses.json"
@@ -95,6 +93,11 @@ def get_session() -> requests.Session:
         _thread_local.session = s
     return s
 
+def print_step(title):
+    print("\n" + "="*70)
+    print(f"  {title}")
+    print("="*70)
+
 # ---------------------------
 # Session Authentication
 # ---------------------------
@@ -102,62 +105,100 @@ def verify_and_initialize_session():
     global VERIFIED_COOKIES
     
     if not STATUS_URL or not GENERATE_LINK_URL:
-        print("[AUTH] STATUS_URL or GENERATE_LINK_URL missing. Skipping auth.")
+        print_step("WARNING: STATUS_URL or GENERATE_LINK_URL missing. Skipping auth.")
         return
 
-    print("--- 1. Checking Session Status ---")
     auth_session = requests.Session()
     
+    # 1. Inject manual cookie if provided via GitHub Secrets (Ultimate Fallback)
     if SESSION_COOKIE:
         print("[AUTH] Injecting manual SESSION_COOKIE from environment variables.")
         auth_session.cookies.set("session", SESSION_COOKIE)
 
+    # 2. Check Status
+    print_step("1. Checking current session status")
+    r_status = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    print("Status code   :", r_status.status_code)
+    print("Cookies       :", dict(auth_session.cookies))
+
     try:
-        r = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        status_data = r.json()
-    except Exception as e:
-        print(f"[AUTH] Failed to fetch status: {e}")
+        status_data = r_status.json()
+        print("Response JSON :")
+        print(json.dumps(status_data, indent=2))
+    except Exception:
+        print("Response (raw):", r_status.text[:600])
         status_data = {}
 
     user_id = status_data.get("user_id")
     verified = status_data.get("verified", False)
     
-    print(f"[AUTH] User ID: {user_id} | Verified: {verified}")
+    print(f"\nUser ID    : {user_id}")
+    print(f"Verified   : {verified}")
 
+    # 3. Request Link & Verify
     if not verified:
-        print("--- 2. Requesting Verification Link ---")
+        print_step("2. Requesting verification link")
         post_headers = HEADERS.copy()
         post_headers["Content-Type"] = "application/json"
 
-        try:
-            r_link = auth_session.post(GENERATE_LINK_URL, headers=post_headers, json={}, timeout=REQUEST_TIMEOUT)
-            data = r_link.json()
-            callback_url = data.get("callback_url")
-            
-            if not callback_url:
-                raise ValueError("No callback_url in response")
-                
-            print("--- 3. Attempting Automated Callback Request ---")
-            r_cb = auth_session.get(callback_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
-            
-            r_status2 = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            new_status = r_status2.json()
-            verified = new_status.get("verified", False)
-            
-        except Exception as e:
-            print(f"[AUTH] Automated verification failed: {e}")
+        r_link = auth_session.post(GENERATE_LINK_URL, headers=post_headers, json={}, timeout=REQUEST_TIMEOUT)
+        print("Status code      :", r_link.status_code)
+        print("Cookies after    :", dict(auth_session.cookies))
 
+        try:
+            data = r_link.json()
+            print("Response JSON:")
+            print(json.dumps(data, indent=2))
+            
+            callback_url = data.get("callback_url")
+            if not callback_url:
+                print("No 'callback_url' key found in JSON response.")
+                raise ValueError("No callback URL")
+                
+        except Exception as e:
+            print(f"Cannot parse JSON or extract link: {e}")
+            print("Raw response (Likely a Firewall/CAPTCHA block):")
+            print(r_link.text[:1000])
+            raise SystemExit(1)
+
+        print_step("3. Trying to GET callback URL (usually WON'T verify in requests on cloud IPs)")
+        print("→ Sending GET to callback (plain requests) ...")
+        r_cb = auth_session.get(callback_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+
+        print("Status code         :", r_cb.status_code)
+        print("Content-Type        :", r_cb.headers.get("Content-Type"))
+        print("Cookies after GET   :", dict(auth_session.cookies))
+
+        if "text/html" in r_cb.headers.get("Content-Type", ""):
+            print("Received HTML → most likely captcha/verification page")
+        
+        print("\n→ Checking /status again after callback attempt...")
+        r_status2 = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        try:
+            new_status = r_status2.json()
+            print(json.dumps(new_status, indent=2))
+            if new_status.get("verified"):
+                print("!!! VERIFIED SUCCESSFULLY WITH REQUESTS !!!")
+                verified = True
+            else:
+                print("Still not verified → manual browser step needed")
+        except:
+            print("Cannot parse /status:", r_status2.text)
+
+    # 4. Final Result Handling
     if verified:
-        print("[AUTH] SESSION VERIFIED SUCCESSFULLY.")
+        print_step("SESSION VERIFIED SUCCESSFULLY")
         VERIFIED_COOKIES = auth_session.cookies.get_dict()
     else:
-        print("\n!!! CRITICAL FAILURE: VERIFICATION REQUIRED !!!")
-        print("Automated verification failed (likely due to Captcha).")
-        print("Because this is running in GitHub Actions, you must manually bypass it.")
-        print("1. Log into the site in your personal browser.")
+        print("\n" + "═"*70)
+        print(" VERIFICATION REQUIRED – MANUAL STEP NEEDED")
+        print("═"*70)
+        print("GitHub Actions IP is being blocked by a security firewall.")
+        print("1. Open the site in your personal browser.")
         print("2. Export your cookies and find the value for 'session'.")
         print("3. Add it to your GitHub Repo Secrets as: SESSION_COOKIE")
         print("4. Rerun this GitHub Action.")
+        print("═"*70)
         raise SystemExit(1)
 
 # ---------------------------
@@ -490,7 +531,7 @@ def main():
     verify_and_initialize_session()
 
     # 2. RUN BATCHES
-    print("--- 4. Fetching Batches ---")
+    print_step("4. Fetching Batches")
     try:
         r = get_session().get(BATCHES_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -525,7 +566,7 @@ def main():
     master_json = load_master_json()
     results = []
 
-    print("--- 5. Spawning Threads for Course Detail Extraction ---")
+    print_step("5. Spawning Threads for Course Detail Extraction")
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
         futures = [ex.submit(fetch_course_details, c, i + 1, len(filtered_courses)) for i, c in enumerate(filtered_courses)]
         for f in as_completed(futures):
