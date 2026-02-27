@@ -6,17 +6,22 @@ import json
 import re
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
+import threading
 
 # ---------------------------
 # ENV CONFIG (production)
 # ---------------------------
-BATCHES_URL = os.getenv("BATCHES_URL") 
-API_BASE = os.getenv("API_BASE")
-
+BATCHES_URL = os.getenv("BATCHES_URL")        
+API_BASE = os.getenv("API_BASE")              
+HANDSHAKE_URL = os.getenv("HANDSHAKE_URL")      
+HANDSHAKE_HEADER_VALUE = os.getenv("HANDSHAKE_HEADER_VALUE)
 if not BATCHES_URL:
     raise RuntimeError("Missing BATCHES_URL secret")
 if not API_BASE:
     raise RuntimeError("Missing API_BASE secret")
+if not HANDSHAKE_URL:
+    raise RuntimeError("Missing HANDSHAKE_URL secret")
 
 _keywords_env = os.getenv("KEYWORDS")
 if not _keywords_env:
@@ -28,16 +33,6 @@ ORIGIN = os.getenv("ORIGIN")
 if not REFERER or not ORIGIN:
     raise RuntimeError("Missing REFERER/ORIGIN secret")
 
-HEADERS = {
-    "Referer": REFERER,
-    "Origin": ORIGIN,
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    ),
-}
-
 THREADS = int(os.getenv("THREADS", "3"))
 MASTER_JSON_FILE = "master_courses.json"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
@@ -47,7 +42,34 @@ BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "0.8"))
 BACKOFF_CAP = float(os.getenv("BACKOFF_CAP", "10"))
 REQUEST_JITTER = float(os.getenv("REQUEST_JITTER", "0.15"))
 
-session = requests.Session()
+# Keep your variable names clean; only the header/cookie protocol uses that value.
+HEADERS = {
+    "Referer": REFERER,
+    "Origin": ORIGIN,
+    "Accept": "*/*",
+    HANDSHAKE_HEADER_NAME: HANDSHAKE_HEADER_VALUE,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    ),
+}
+
+# --------------------------
+# Thread-local session (important for multi-thread stability)
+# ---------------------------
+_thread_local = threading.local()
+
+def get_session() -> requests.Session:
+    """
+    Each worker thread gets its own session + cookies,
+    preventing cookie races across threads.
+    """
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        _thread_local.session = s
+    return s
 
 
 # ---------------------------
@@ -61,18 +83,60 @@ def ensure_list(x):
     return []
 
 
-def safe_get(url):
+def to_api_path(url: str) -> str | None:
     """
-    Robust GET with retries.
+    Convert a full API URL to the /api/... path needed by handshake endpoint.
+    Example:
+      API_BASE = https://kgs-web.vercel.app/api
+      url      = https://kgs-web.vercel.app/api/classroom/848
+      -> /api/classroom/848
+    """
+    if not isinstance(url, str):
+        return None
+    if not url.startswith(API_BASE):
+        return None
+    suffix = url[len(API_BASE):]  # includes leading "/" like "/classroom/848"
+    return "/api" + suffix
+
+
+def prime_handshake(session: requests.Session, api_path: str, method: str = "GET") -> bool:
+    """
+    Call handshake endpoint to set cookies for the next real API request.
+    api_path MUST look like /api/... (dynamic, derived from the URL).
+    """
+    try:
+        # Example:
+        # HANDSHAKE_URL = https://kgs-web.vercel.app/api/sunny-keys
+        # -> https://.../sunny-keys?path=/api/classroom/848&method=GET
+        url = f"{HANDSHAKE_URL}?path={quote(api_path, safe='/:?=&')}&method={method}"
+        r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def safe_get(url: str):
+    """
+    Robust GET with retries + handshake priming.
     Returns: (json_data_or_None, ok_bool)
     """
+    api_path = to_api_path(url)
+
     for attempt in range(1, MAX_RETRIES + 1):
         if REQUEST_JITTER > 0:
             time.sleep(random.uniform(0, REQUEST_JITTER))
+
+        session = get_session()
+
+        # Prime cookies immediately before real request (no artificial long sleep).
+        if api_path:
+            prime_handshake(session, api_path, "GET")
+
         try:
             r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             code = r.status_code
 
+            # transient server errors
             if code in (500, 502, 503, 504):
                 wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
                 if attempt < MAX_RETRIES:
@@ -80,7 +144,12 @@ def safe_get(url):
                     continue
                 return None, False
 
+            # other non-200 errors: retry a few times because handshake cookies may expire quickly
             if code != 200:
+                wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+                if attempt < MAX_RETRIES:
+                    time.sleep(wait)
+                    continue
                 return None, False
 
             try:
@@ -304,7 +373,7 @@ for kw in KEYWORDS:
 
 
 # ---------------------------
-# Fetch course details (new API)
+# Fetch course details (API)
 # ---------------------------
 def fetch_course_details(course, rank, total):
     cid = course.get("id")
@@ -425,7 +494,18 @@ def fetch_course_details(course, rank, total):
 
 def main():
     print("Fetching batches list...", flush=True)
-    batches_data, batches_ok = safe_get(BATCHES_URL)
+
+    # BATCHES_URL may be on a different host (GitHub pages). It usually doesn't need handshake.
+    # We'll fetch it with a plain one-off session for safety.
+    try:
+        r = requests.get(BATCHES_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"batches status={r.status_code}")
+        batches_data = r.json()
+        batches_ok = True
+    except Exception:
+        batches_data, batches_ok = None, False
+
     batches = ensure_list(batches_data)
 
     if not batches_ok or not batches:
@@ -446,7 +526,6 @@ def main():
 
     print(f"Matched courses: {len(filtered_courses)}", flush=True)
     if not filtered_courses:
-        # not an outage: just no matches
         save_master_json(load_master_json())
         print("no_matches_done", flush=True)
         return
