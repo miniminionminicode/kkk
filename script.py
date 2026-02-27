@@ -18,16 +18,16 @@ HANDSHAKE_URL = os.getenv("HANDSHAKE_URL")
 HANDSHAKE_HEADER_NAME = os.getenv("HANDSHAKE_HEADER_NAME")   
 HANDSHAKE_HEADER_VALUE = os.getenv("HANDSHAKE_HEADER_VALUE")
 
+STATUS_URL = os.getenv("STATUS_URL")
+GENERATE_LINK_URL = os.getenv("GENERATE_LINK_URL")
+SESSION_COOKIE = os.getenv("SESSION_COOKIE")
+
 if not BATCHES_URL:
     raise RuntimeError("Missing BATCHES_URL secret")
 if not API_BASE:
     raise RuntimeError("Missing API_BASE secret")
 if not HANDSHAKE_URL:
     raise RuntimeError("Missing HANDSHAKE_URL secret")
-if not HANDSHAKE_HEADER_NAME:
-    raise RuntimeError("Missing HANDSHAKE_HEADER_NAME secret")
-if not HANDSHAKE_HEADER_VALUE:
-    raise RuntimeError("Missing HANDSHAKE_HEADER_VALUE secret")
 
 _keywords_env = os.getenv("KEYWORDS")
 if not _keywords_env:
@@ -47,8 +47,6 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "0.8"))
 BACKOFF_CAP = float(os.getenv("BACKOFF_CAP", "10"))
 REQUEST_JITTER = float(os.getenv("REQUEST_JITTER", "0.15"))
-
-# Handshake validity is ~8 seconds. Use "8-2" margin => 6 seconds default.
 HANDSHAKE_VALIDITY_SEC = float(os.getenv("HANDSHAKE_VALIDITY_SEC", "6"))
 
 DEBUG = os.getenv("DEBUG", "1") == "1"
@@ -58,61 +56,124 @@ def log(msg: str):
         tname = threading.current_thread().name
         print(f"[{tname}] {msg}", flush=True)
 
+# ---------------------------
+# Headers Setup
+# ---------------------------
 HEADERS = {
-    "Referer": REFERER,
-    "Origin": ORIGIN,
-    "Accept": "*/*",
-    HANDSHAKE_HEADER_NAME: HANDSHAKE_HEADER_VALUE,  # header name & value both hidden via secrets
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
+        "Chrome/122.0.0.0 Safari/537.36"
     ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": REFERER,
+    "Origin": ORIGIN,
+    "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="122", "Chromium";v="122"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "priority": "u=1, i",
 }
 
+if HANDSHAKE_HEADER_NAME and HANDSHAKE_HEADER_VALUE:
+    HEADERS[HANDSHAKE_HEADER_NAME] = HANDSHAKE_HEADER_VALUE
+
 # ---------------------------
-# Thread-local session (important for multi-thread stability)
+# Global Auth State & Thread Local
 # ---------------------------
+VERIFIED_COOKIES = {}
 _thread_local = threading.local()
 
 def get_session() -> requests.Session:
-    """
-    Each worker thread gets its own session + cookies.
-    This prevents cookie races across threads.
-    """
     s = getattr(_thread_local, "session", None)
     if s is None:
         s = requests.Session()
+        s.cookies.update(VERIFIED_COOKIES)
         _thread_local.session = s
     return s
 
 # ---------------------------
-# Helpers
+# Session Authentication
+# ---------------------------
+def verify_and_initialize_session():
+    global VERIFIED_COOKIES
+    
+    if not STATUS_URL or not GENERATE_LINK_URL:
+        print("[AUTH] STATUS_URL or GENERATE_LINK_URL missing. Skipping auth.")
+        return
+
+    print("--- 1. Checking Session Status ---")
+    auth_session = requests.Session()
+    
+    if SESSION_COOKIE:
+        print("[AUTH] Injecting manual SESSION_COOKIE from environment variables.")
+        auth_session.cookies.set("session", SESSION_COOKIE)
+
+    try:
+        r = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        status_data = r.json()
+    except Exception as e:
+        print(f"[AUTH] Failed to fetch status: {e}")
+        status_data = {}
+
+    user_id = status_data.get("user_id")
+    verified = status_data.get("verified", False)
+    
+    print(f"[AUTH] User ID: {user_id} | Verified: {verified}")
+
+    if not verified:
+        print("--- 2. Requesting Verification Link ---")
+        post_headers = HEADERS.copy()
+        post_headers["Content-Type"] = "application/json"
+
+        try:
+            r_link = auth_session.post(GENERATE_LINK_URL, headers=post_headers, json={}, timeout=REQUEST_TIMEOUT)
+            data = r_link.json()
+            callback_url = data.get("callback_url")
+            
+            if not callback_url:
+                raise ValueError("No callback_url in response")
+                
+            print("--- 3. Attempting Automated Callback Request ---")
+            r_cb = auth_session.get(callback_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+            
+            r_status2 = auth_session.get(STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            new_status = r_status2.json()
+            verified = new_status.get("verified", False)
+            
+        except Exception as e:
+            print(f"[AUTH] Automated verification failed: {e}")
+
+    if verified:
+        print("[AUTH] SESSION VERIFIED SUCCESSFULLY.")
+        VERIFIED_COOKIES = auth_session.cookies.get_dict()
+    else:
+        print("\n!!! CRITICAL FAILURE: VERIFICATION REQUIRED !!!")
+        print("Automated verification failed (likely due to Captcha).")
+        print("Because this is running in GitHub Actions, you must manually bypass it.")
+        print("1. Log into the site in your personal browser.")
+        print("2. Export your cookies and find the value for 'session'.")
+        print("3. Add it to your GitHub Repo Secrets as: SESSION_COOKIE")
+        print("4. Rerun this GitHub Action.")
+        raise SystemExit(1)
+
+# ---------------------------
+# Request Helpers
 # ---------------------------
 def ensure_list(x):
-    if isinstance(x, list):
-        return x
-    if isinstance(x, dict):
-        return [x]
+    if isinstance(x, list): return x
+    if isinstance(x, dict): return [x]
     return []
 
 def to_api_path(url: str):
-    """
-    Convert full API URL to /api/... path needed by handshake.
-    API_BASE must include '/api' at the end, e.g. https://host/api
-    """
-    if not isinstance(url, str):
+    if not isinstance(url, str) or not url.startswith(API_BASE):
         return None
-    if not url.startswith(API_BASE):
-        return None
-    suffix = url[len(API_BASE):]  # e.g. "/classroom/848"
-    return "/api" + suffix
+    return "/api" + url[len(API_BASE):]
 
 def prime_handshake(session: requests.Session, api_path: str, method: str = "GET") -> tuple[bool, float]:
-    """
-    Calls handshake endpoint to set short-lived cookies.
-    Returns (ok, timestamp_when_done).
-    """
     try:
         url = f"{HANDSHAKE_URL}?path={quote(api_path, safe='/:?=&')}&method={method}"
         r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
@@ -128,54 +189,31 @@ def prime_handshake(session: requests.Session, api_path: str, method: str = "GET
         return False, ts
 
 def safe_get(url: str):
-    """
-    Robust GET with retries + handshake before EVERY request.
-    IMPORTANT: We do all sleeps BEFORE handshake so the real request always
-    happens immediately after handshake (within HANDSHAKE_VALIDITY_SEC window).
-    Returns: (json_data_or_None, ok_bool)
-    """
     api_path = to_api_path(url)
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # Any delays happen BEFORE handshake (so handshake -> request stays tight)
         if REQUEST_JITTER > 0:
             time.sleep(random.uniform(0, REQUEST_JITTER))
 
         session = get_session()
-
-        hs_ok = True
-        hs_ts = 0.0
+        hs_ok, hs_ts = True, 0.0
+        
         if api_path:
             hs_ok, hs_ts = prime_handshake(session, api_path, "GET")
 
-        # No sleeps or extra work here — request must be immediately after handshake
         try:
             r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             code = r.status_code
 
-            # We log AFTER the request (logging does not affect handshake validity)
             if api_path:
                 age = time.time() - hs_ts
-                log(f"[REQ] {code} {url} (try {attempt}) hs_ok={hs_ok} hs_age={age:.2f}s")
-                if age > HANDSHAKE_VALIDITY_SEC:
-                    log(f"[WARN] Handshake-to-request age {age:.2f}s exceeded {HANDSHAKE_VALIDITY_SEC:.2f}s")
+                log(f"[REQ] {code} {url} (try {attempt}) hs_age={age:.2f}s")
             else:
                 log(f"[REQ] {code} {url} (try {attempt}) (no-handshake)")
 
-            # retry on common transient server errors
-            if code in (500, 502, 503, 504):
+            if code in (500, 502, 503, 504, 401, 403):
                 if attempt < MAX_RETRIES:
                     wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
-                    log(f"[RETRY SERVER] wait={wait:.2f}s")
-                    time.sleep(wait)
-                    continue
-                return None, False
-
-            # retry on auth-like failures too (cookies can be picky)
-            if code in (401, 403):
-                if attempt < MAX_RETRIES:
-                    wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
-                    log(f"[RETRY AUTH] wait={wait:.2f}s")
                     time.sleep(wait)
                     continue
                 return None, False
@@ -183,37 +221,31 @@ def safe_get(url: str):
             if code != 200:
                 return None, False
 
-            try:
-                return r.json(), True
-            except Exception:
-                log(f"[JSON FAIL] {url}")
-                return None, False
+            try: return r.json(), True
+            except Exception: return None, False
 
         except requests.RequestException as e:
-            log(f"[REQ ERROR] {url} err={e}")
             if attempt < MAX_RETRIES:
                 wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
                 time.sleep(wait)
                 continue
             return None, False
 
-    log(f"[FAILED AFTER RETRIES] {url}")
     return None, False
 
+# ---------------------------
+# Data Merge Logistics
+# ---------------------------
 def load_master_json():
     try:
         with open(MASTER_JSON_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if not isinstance(data, list):
-                raise ValueError("master_courses.json is not a list")
+            if not isinstance(data, list): raise ValueError("Not a list")
             for c in data:
                 if isinstance(c, dict) and c.get("course_id") is not None:
                     c["course_id"] = str(c["course_id"])
             return data
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        raise RuntimeError(f"Failed to read {MASTER_JSON_FILE}: {e}")
+    except Exception: return []
 
 def save_master_json(data):
     tmp = MASTER_JSON_FILE + ".tmp"
@@ -221,8 +253,7 @@ def save_master_json(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, MASTER_JSON_FILE)
 
-def is_blank(x):
-    return x in (None, "", [], {})
+def is_blank(x): return x in (None, "", [], {})
 
 def merge_scalar_fill_only(existing_dict, k, new_val):
     if is_blank(existing_dict.get(k)) and not is_blank(new_val):
@@ -231,68 +262,51 @@ def merge_scalar_fill_only(existing_dict, k, new_val):
 def merge_dict_fill_only(existing, new):
     for k, v in (new or {}).items():
         if isinstance(v, dict):
-            if not isinstance(existing.get(k), dict):
-                existing[k] = {}
+            if not isinstance(existing.get(k), dict): existing[k] = {}
             merge_dict_fill_only(existing[k], v)
         elif isinstance(v, list):
-            if not isinstance(existing.get(k), list):
-                existing[k] = []
+            if not isinstance(existing.get(k), list): existing[k] = []
         else:
             merge_scalar_fill_only(existing, k, v)
 
 def merge_list_by_key(existing_list, new_list, key="id"):
-    if not isinstance(existing_list, list):
-        existing_list = []
-    if not isinstance(new_list, list):
-        return existing_list
+    if not isinstance(existing_list, list): existing_list = []
+    if not isinstance(new_list, list): return existing_list
 
     index = {}
     for idx, item in enumerate(existing_list):
         if isinstance(item, dict):
             item_id = item.get(key)
-            if item_id not in (None, ""):
-                index[str(item_id)] = idx
+            if item_id not in (None, ""): index[str(item_id)] = idx
 
     for item in new_list:
         if not isinstance(item, dict):
-            if item not in existing_list:
-                existing_list.append(item)
+            if item not in existing_list: existing_list.append(item)
             continue
-
         item_id = item.get(key)
         if item_id in (None, ""):
-            if item not in existing_list:
-                existing_list.append(item)
+            if item not in existing_list: existing_list.append(item)
             continue
-
         sid = str(item_id)
-        if sid in index:
-            merge_dict_fill_only(existing_list[index[sid]], item)
+        if sid in index: merge_dict_fill_only(existing_list[index[sid]], item)
         else:
             existing_list.append(item)
             index[sid] = len(existing_list) - 1
-
     return existing_list
 
 def fingerprint(item):
-    if not isinstance(item, dict):
-        return str(item)
+    if not isinstance(item, dict): return str(item)
     for k in ("id", "notice_id", "_id", "update_id"):
         v = item.get(k)
-        if v not in (None, "", [], {}):
-            return f"{k}:{v}"
-    ts = item.get("published_at") or item.get("publishedAt") or item.get("created_at") or item.get("createdAt") or ""
+        if v not in (None, "", [], {}): return f"{k}:{v}"
+    ts = item.get("published_at") or item.get("createdAt") or ""
     body = item.get("content") or item.get("message") or item.get("description") or ""
     return f"{ts}|{hash(body)}"
 
 def merge_list_by_fingerprint(existing_list, new_list):
-    if not isinstance(existing_list, list):
-        existing_list = []
-    if not isinstance(new_list, list):
-        return existing_list
-
+    if not isinstance(existing_list, list): existing_list = []
+    if not isinstance(new_list, list): return existing_list
     idx = {fingerprint(item): i for i, item in enumerate(existing_list)}
-
     for item in new_list:
         fp = fingerprint(item)
         if fp in idx:
@@ -301,58 +315,41 @@ def merge_list_by_fingerprint(existing_list, new_list):
         else:
             existing_list.append(item)
             idx[fp] = len(existing_list) - 1
-
     return existing_list
 
 def merge_course(existing_course, new_course):
     merge_dict_fill_only(existing_course, {k: v for k, v in new_course.items() if k != "_ok"})
-
     ok = new_course.get("_ok") or {}
-    classroom_ok = bool(ok.get("classroom"))
-    updates_ok = bool(ok.get("updates"))
-
-    if classroom_ok:
+    
+    if ok.get("classroom"):
         existing_course["classroom"] = merge_list_by_key(
-            existing_course.get("classroom", []),
-            new_course.get("classroom", []),
-            key="id"
+            existing_course.get("classroom", []), new_course.get("classroom", []), key="id"
         )
-
         existing_lessons = existing_course.get("lessons", [])
-        if not isinstance(existing_lessons, list):
-            existing_lessons = []
-
+        if not isinstance(existing_lessons, list): existing_lessons = []
         new_lessons = new_course.get("lessons", [])
-        if not isinstance(new_lessons, list):
-            new_lessons = []
+        if not isinstance(new_lessons, list): new_lessons = []
 
         lesson_idx = {}
         for i, l in enumerate(existing_lessons):
             if isinstance(l, dict):
                 lid = l.get("lesson_id")
-                if lid not in (None, ""):
-                    lesson_idx[str(lid)] = i
+                if lid not in (None, ""): lesson_idx[str(lid)] = i
 
         for lesson in new_lessons:
             if not isinstance(lesson, dict):
-                if lesson not in existing_lessons:
-                    existing_lessons.append(lesson)
+                if lesson not in existing_lessons: existing_lessons.append(lesson)
                 continue
-
             lid = lesson.get("lesson_id")
             if lid in (None, ""):
-                if lesson not in existing_lessons:
-                    existing_lessons.append(lesson)
+                if lesson not in existing_lessons: existing_lessons.append(lesson)
                 continue
-
             lid = str(lid)
             if lid in lesson_idx:
                 target = existing_lessons[lesson_idx[lid]]
                 merge_dict_fill_only(target, lesson)
-
                 target["videos"] = merge_list_by_key(target.get("videos", []), lesson.get("videos", []), key="id")
                 target["notes"] = merge_list_by_key(target.get("notes", []), lesson.get("notes", []), key="id")
-
                 target["video_count"] = len(target.get("videos", [])) if isinstance(target.get("videos"), list) else 0
                 target["note_count"] = len(target.get("notes", [])) if isinstance(target.get("notes"), list) else 0
                 target["lesson_count"] = target["video_count"] + target["note_count"]
@@ -360,19 +357,15 @@ def merge_course(existing_course, new_course):
                 lesson["video_count"] = len(lesson.get("videos", [])) if isinstance(lesson.get("videos"), list) else 0
                 lesson["note_count"] = len(lesson.get("notes", [])) if isinstance(lesson.get("notes"), list) else 0
                 lesson["lesson_count"] = lesson["video_count"] + lesson["note_count"]
-
                 existing_lessons.append(lesson)
                 lesson_idx[lid] = len(existing_lessons) - 1
-
+        
         existing_course["lessons"] = existing_lessons
-        existing_course["lesson_count"] = sum(
-            (l.get("lesson_count") or 0) for l in existing_lessons if isinstance(l, dict)
-        )
+        existing_course["lesson_count"] = sum((l.get("lesson_count") or 0) for l in existing_lessons if isinstance(l, dict))
 
-    if updates_ok:
+    if ok.get("updates"):
         existing_course["announcements"] = merge_list_by_fingerprint(
-            existing_course.get("announcements", []),
-            new_course.get("announcements", [])
+            existing_course.get("announcements", []), new_course.get("announcements", [])
         )
 
 def upsert_course(master_json, course_id, new_course):
@@ -384,7 +377,7 @@ def upsert_course(master_json, course_id, new_course):
     master_json.append(new_course)
 
 # ---------------------------
-# Keyword filtering
+# Filter and Fetch
 # ---------------------------
 keyword_patterns = []
 for kw in KEYWORDS:
@@ -395,9 +388,6 @@ for kw in KEYWORDS:
     else:
         keyword_patterns.append(re.compile(rf"\b{re.escape(kw)}\b", re.I))
 
-# ---------------------------
-# Fetch course details (API)
-# ---------------------------
 def fetch_course_details(course, rank, total):
     cid = course.get("id")
     cname = course.get("title") or ""
@@ -428,27 +418,19 @@ def fetch_course_details(course, rank, total):
         out["classroom"] = classroom
 
         for cls in classroom:
-            if not isinstance(cls, dict):
-                continue
+            if not isinstance(cls, dict): continue
             lesson_id = cls.get("id")
-            if not lesson_id:
-                continue
+            if not lesson_id: continue
 
             lesson_data, lesson_ok = safe_get(f"{API_BASE}/lesson/{lesson_id}")
-            if not lesson_ok or not isinstance(lesson_data, dict):
-                log(f"[LESSON FAIL] course_id={cid} lesson_id={lesson_id}")
-                continue
+            if not lesson_ok or not isinstance(lesson_data, dict): continue
 
-            # videos
             videos_out = []
             for v in ensure_list(lesson_data.get("videos")):
-                if not isinstance(v, dict):
-                    continue
+                if not isinstance(v, dict): continue
                 vid = v.get("id")
-
                 vd_data, vd_ok = (None, False)
-                if vid:
-                    vd_data, vd_ok = safe_get(f"{API_BASE}/video/{vid}")
+                if vid: vd_data, vd_ok = safe_get(f"{API_BASE}/video/{vid}")
                 vd = vd_data if isinstance(vd_data, dict) else {}
 
                 videos_out.append({
@@ -463,16 +445,12 @@ def fetch_course_details(course, rank, total):
                     "video_pdfs": vd.get("pdfs", None) if vd_ok else None,
                 })
 
-            # notes/uploads/tests
             notes_out = []
             for n in ensure_list(lesson_data.get("notes")):
-                if not isinstance(n, dict):
-                    continue
+                if not isinstance(n, dict): continue
                 nid = n.get("id")
-
                 nd_data, nd_ok = (None, False)
-                if nid:
-                    nd_data, nd_ok = safe_get(f"{API_BASE}/video/{nid}")
+                if nid: nd_data, nd_ok = safe_get(f"{API_BASE}/video/{nid}")
                 nd = nd_data if isinstance(nd_data, dict) else {}
 
                 notes_out.append({
@@ -504,19 +482,17 @@ def fetch_course_details(course, rank, total):
 
     out["lesson_count"] = sum((l.get("lesson_count") or 0) for l in out.get("lessons", []) if isinstance(l, dict))
 
-    print(
-        f"[{rank}/{total}] DONE  course_id={cid} lessons={len(out.get('lessons', []))} "
-        f"announcements={len(out.get('announcements', []))} lesson_count={out.get('lesson_count', 0)}",
-        flush=True
-    )
+    print(f"[{rank}/{total}] DONE  course_id={cid} lessons={len(out.get('lessons', []))} announcements={len(out.get('announcements', []))}", flush=True)
     return out
 
 def main():
-    print("Fetching batches list...", flush=True)
+    # 1. AUTHENTICATE FIRST
+    verify_and_initialize_session()
 
-    # Batches list likely does not need handshake
+    # 2. RUN BATCHES
+    print("--- 4. Fetching Batches ---")
     try:
-        r = requests.get(BATCHES_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r = get_session().get(BATCHES_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             raise RuntimeError(f"batches status={r.status_code}")
         batches_data = r.json()
@@ -535,11 +511,9 @@ def main():
 
     filtered_courses = []
     for item in batches:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict): continue
         title = (item.get("title") or "").lower()
-        if not any(p.search(title) for p in keyword_patterns):
-            continue
+        if not any(p.search(title) for p in keyword_patterns): continue
         filtered_courses.append(item)
 
     print(f"Matched courses: {len(filtered_courses)}", flush=True)
@@ -551,18 +525,14 @@ def main():
     master_json = load_master_json()
     results = []
 
+    print("--- 5. Spawning Threads for Course Detail Extraction ---")
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futures = [
-            ex.submit(fetch_course_details, c, i + 1, len(filtered_courses))
-            for i, c in enumerate(filtered_courses)
-        ]
+        futures = [ex.submit(fetch_course_details, c, i + 1, len(filtered_courses)) for i, c in enumerate(filtered_courses)]
         for f in as_completed(futures):
             results.append(f.result())
 
-    any_ok_anywhere = any(
-        r.get("_ok", {}).get("classroom") or r.get("_ok", {}).get("updates")
-        for r in results
-    )
+    any_ok_anywhere = any((r.get("_ok", {}).get("classroom") or r.get("_ok", {}).get("updates")) for r in results)
+    
     if not any_ok_anywhere:
         with open("SKIP_PUSH", "w", encoding="utf-8") as f:
             f.write("1")
@@ -571,12 +541,10 @@ def main():
 
     for r in results:
         cid = r.get("course_id")
-        if cid:
-            upsert_course(master_json, cid, r)
+        if cid: upsert_course(master_json, cid, r)
 
     for c in master_json:
-        if isinstance(c, dict):
-            c.pop("_ok", None)
+        if isinstance(c, dict): c.pop("_ok", None)
 
     save_master_json(master_json)
     print("done", flush=True)
