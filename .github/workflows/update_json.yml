@@ -34,9 +34,16 @@ jobs:
         env:
           BATCHES_URL: ${{ secrets.BATCHES_URL }}
           API_BASE: ${{ secrets.API_BASE }}
+
+          # NEW: handshake protocol (hidden)
+          HANDSHAKE_URL: ${{ secrets.HANDSHAKE_URL }}
+          HANDSHAKE_HEADER_NAME: ${{ secrets.HANDSHAKE_HEADER_NAME }}
+          HANDSHAKE_HEADER_VALUE: ${{ secrets.HANDSHAKE_HEADER_VALUE }}
+
           KEYWORDS: ${{ secrets.KEYWORDS }}
           REFERER: ${{ secrets.REFERER }}
           ORIGIN: ${{ secrets.ORIGIN }}
+
           THREADS: "3"
           MAX_RETRIES: "5"
           REQUEST_TIMEOUT: "25"
